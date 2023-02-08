@@ -1,0 +1,401 @@
+####################################################################
+# 
+# For: AINVR Validate OS RAID is set up
+#
+####################################################################
+cls
+# Set up logging
+if ( Test-Path R:\ ) 
+{
+	$logRoot="R:"
+} else {
+	if ( -not (Test-Path C:\Windows\Options\Logs )) { mkdir c:\Windows\Options\Logs }
+	$logRoot="C:\Windows\Options\Logs"
+}
+Start-Transcript -Path $logRoot\RAID_Validate_or_Setup.log -Append
+Set-Location -Path $PSScriptRoot
+# Variable setup
+$DesiredProduct = @{Disk1Model = "DELL IDSDM USB Device";
+					Disk0Model = "DELL PERC H755 Adp SCSI Disk Device";
+					PERCLocation="RAID.Slot.1-1";
+					PERCRAIDPDStatus="OK";
+					PERCName="PERC H755 Adapter (PCI Slot 1)";
+					PERCVDName="storage";
+					PERCRAIDType="Raid-5";
+					PERCVDStatus="Ok";
+					PERCVDState="Online";
+					PERCVDOpState="Not applicable";
+					IDSDMEnabled="On";
+					IDSDMSize="32152619520";
+					IDSDMRAIDMode="Mirror";
+					SecureBootStatus="Disabled";
+					SecureBootPolicy="Custom";
+					SecureBootMode="UserMode";
+					TPMStatus="On";
+					BootMode="UEFI";
+					NetworkBoot="Enabled";}
+					
+$testResults=New-Object 'System.Collections.Generic.List[bool]'
+$wshell = New-Object -ComObject Wscript.Shell
+$WMICPU = Get-WmiObject -Class win32_processor
+$WMIPhyMem = Get-WmiObject -Class Win32_PhysicalMemory
+$WMICompSys= Get-WmiObject -Class Win32_ComputerSystem
+$WMIDisks = Get-WmiObject -Class win32_diskdrive
+
+
+Write-Host "Gathering PERC RAID information..."
+$controllerInfo=X:\racadm\racadm.exe storage get controllers:$($DesiredProduct.PERCLocation)
+if ($controllerInfo -match "error") {
+	Write-Host ""
+	Write-Host "Failed to get controller information using location $($DesiredProduct.PERCLocation).`n`nScript may need updating, RAID controller may be missing, or RAID Controller installed in wrong slot." -ForegroundColor Red
+	Write-Host ""
+	Write-Host "Available controllers:"
+	X:\racadm\racadm.exe storage get controllers
+	while($true) {
+		$wshell.Popup("!!! DO NOT CONTINUE !!!`n`n`nFailed to get controller information using location $($DesiredProduct.PERCLocation). Script may need updating`n`n`nPlease Contact Engineering.",0,"FAIL",16) > $null
+	}
+}
+$percName=($controllerInfo |Select-String -Pattern "\sName\s*=.*").Line.Split('=')[1].Trim()
+
+Write-Host "Gathering RAID Virtual Disk information..."
+120..0 |foreach {start-sleep -s 1; Write-Progress -Activity "Waiting 2 minutes before checking Virtual Disk status" -Status "$(get-date) - $_ second(s) remaining" -PercentComplete (100-($_/120*100))}
+Write-Progress -Completed -Activity  "Waiting 2 minutes before checking Virtual Disk status"
+$vdisk=x:\racadm\racadm.exe storage get vdisks -o --refkey $($DesiredProduct.PERCLocation)
+$vdSize = ($vdisk |Select-String -Pattern "\sSize\s*=.*").Line.Split('=')[1].Trim().Split()[0].Trim()
+$vdType = ($vdisk |Select-String -Pattern "\sLayout\s*=.*").Line.Split('=')[1].Trim()
+$vdState = ($vdisk |Select-String -Pattern "\sState\s*=.*").Line.Split('=')[1].Trim()
+$vdOpState = ($vdisk |Select-String -Pattern "\sOperationalState\s*=.*").Line.Split('=')[1].Trim()
+$vdStatus = ($vdisk |Select-String -Pattern "\sStatus\s*=.*").Line.Split('=')[1].Trim()
+$pdCache = ($vdisk |Select-String -Pattern "\sDiskCachePolicy\s*=.*").Line.Split('=')[1].Trim()
+$vdName = ($vdisk |Select-String -Pattern "\sName\s*=.*").Line.Split('=')[1].Trim()
+$vdSpanCount = ($vdisk |Select-String -Pattern "\sSpanDepth\s*=.*").Line.Split('=')[1].Trim()
+
+Write-Host "Gathering IDSDM RAID information..."
+$IDSDMEnabled=(X:\racadm\racadm.exe get BIOS.IntegratedDevices.InternalSdCard | Select-String -Pattern "^InternalSdCard=").Line.Split("=")[1].Trim()
+$IDSDMRAIDMode=(X:\racadm\racadm.exe get BIOS.IntegratedDevices.InternalSdCardRedundancy | Select-String -Pattern "^InternalSdCardRedundancy=").Line.Split("=")[1].Trim()
+
+Write-Host "Gathering BIOS info"
+$tpmStatus=(X:\racadm\racadm.exe get BIOS.syssecurity | Select-String -Pattern "^TpmSecurity=").Line.Split("=")[1].Trim()
+$secureBootStatus=(X:\racadm\racadm.exe get BIOS.syssecurity | Select-String -Pattern "^SecureBoot=").Line.Split("=")[1].Trim()
+$secureBootPolicy=(X:\racadm\racadm.exe get BIOS.syssecurity.SecureBootPolicy | Select-String -Pattern "^SecureBootPolicy=").Line.Split("=")[1].Trim()
+$secureBootMode=(X:\racadm\racadm.exe get BIOS.syssecurity.SecureBootMode | Select-String -Pattern "^SecureBootMode=").Line.Split("=")[1].Trim()
+$biosBootMode=(X:\racadm\racadm.exe get BIOS.BiosBootSettings.BootMode | Select-String -Pattern "^BootMode=").Line.Split("=")[1].Trim()
+$networkBootMode=(X:\racadm\racadm.exe get BIOS.NetworkSettings.PxeDev1EnDis | Select-String -Pattern "^PxeDev1EnDis=").Line.Split("=")[1].Trim()
+
+# Function Setup PERC RAID
+function InitPERCRAID {
+	#Wait 10 seconds before automatically wiping the RAID and rebuilding. Give them a chance to cancel
+	10..0 |foreach {start-sleep -s 1; Write-Progress -Activity "Waiting 10 seconds before clearing and creating the RAID" -Status "$(get-date) - $_ second(s) remaining" -PercentComplete (100-($_/10*100))}
+	
+	cls
+	$startTime=$(get-date)
+	Write-Host "===== Started: $startTime ====="
+	Write-Host ""
+	Write-Host "Removing any old arrays..."
+	$tempVar = X:\racadm\racadm.exe storage resetconfig:$($DesiredProduct.PERCLocation)
+	$tempVar = X:\racadm\racadm.exe storage clearconfig:$($DesiredProduct.PERCLocation)
+	$resetOutput = X:\racadm\racadm.exe jobqueue create $($DesiredProduct.PERCLocation) -s TIME_NOW --realtime
+	$resetID = ($resetOutput |Select-String "Commit JID =").Line.Split("=")[1].Trim()
+	WaitForJobComplete($resetID)
+		
+	Write-Host "Create the RAID..."
+	$phyDisks = (x:\racadm\racadm.exe storage get pdisks --refkey ($DesiredProduct.PERCLocation) |Select-String "Disk") -join ","
+	$tempVar = X:\racadm\racadm.exe storage createvd:$($DesiredProduct.PERCLocation) -rl r5 -wp wb -rp ra  -ss 256k -pdkey:$phyDisks -dcp disabled -name "Storage"
+	$createOutput = X:\racadm\racadm.exe jobqueue create $($DesiredProduct.PERCLocation) -s TIME_NOW --realtime
+	$createID = ($createOutput |Select-String "Commit JID =").Line.Split("=")[1].Trim()
+	WaitForJobComplete($createID)
+	
+	Write-Host "Wait 1 minute before starting RAID initialization"	
+	60..0 |foreach {start-sleep -s 1; Write-Progress -Activity "Waiting 60 seconds before Full Initialization of the RAID" -Status "$(get-date) - $_ second(s) remaining" -PercentComplete (100-($_/60*100))}
+	Write-Progress -Completed -Activity "Waiting 60 seconds before Full Initialization of the RAID"
+	
+	Write-Host "Checking for background initialization..."
+	$virtDisk = (x:\racadm\racadm.exe storage get vdisks --refkey $($DesiredProduct.PERCLocation)|Select-String "Disk").Line.Trim()
+	if (x:\racadm\racadm.exe storage get vdisks --refkey $($DesiredProduct.PERCLocation) -o |select-string "Background Initialization") 
+	{
+		Write-Host "Background Init has started, need to cancel before starting the Full Init"
+		$tempVar = x:\racadm\racadm.exe storage cancelbgi:$($virtDisk)
+		$cancelInitOutput = X:\racadm\racadm.exe jobqueue create $($DesiredProduct.PERCLocation) -s TIME_NOW --realtime
+		$cancelID = ($cancelInitOutput |Select-String "Commit JID =").Line.Split("=")[1].Trim()
+		WaitForJobComplete($cancelID )
+	}
+
+	Write-Host "Initialize the RAID..."
+	$virtDisk = (x:\racadm\racadm.exe storage get vdisks --refkey $($DesiredProduct.PERCLocation)|Select-String "Disk").Line.Trim()
+	$tempVar = X:\racadm\racadm.exe storage init:$virtDisk -speed full
+	$initOutput = X:\racadm\racadm.exe jobqueue create $($DesiredProduct.PERCLocation) -s TIME_NOW --realtime
+	$initID = ($initOutput |Select-String "Commit JID =").Line.Split("=")[1].Trim()
+	WaitForJobComplete($initID)
+	
+	Write-Host "Initialization started. Waiting for it to finish"
+	WaitForInitialization
+}
+
+# Function Wait for RACADM Job to Complete
+function WaitForJobComplete {
+	param ([string]$JobID)
+	$jobInfo = x:\racadm\racadm.exe jobqueue view -i $JobID
+	$jobStatus = ($jobInfo | Select-String "Status=").Line.Split("=")[1].Trim()
+	$jobName = ($jobInfo | Select-String "Job Name=").Line.Split("=")[1].Trim()
+	$jobPercent = ($jobInfo | Select-String "Percent Complete=").Line.Split("=")[1].Trim().Replace("[","").Replace("]","")
+	
+	while ($jobStatus -notmatch 'Completed') {
+		$jobInfo = x:\racadm\racadm.exe jobqueue view -i $JobID
+		$jobStatus = ($jobInfo | Select-String "Status=").Line.Split("=")[1].Trim()
+		$jobName = ($jobInfo | Select-String "Job Name=").Line.Split("=")[1].Trim()
+		$jobPercent = ($jobInfo | Select-String "Percent Complete=").Line.Split("=")[1].Trim().Replace("[","").Replace("]","")
+		
+		5..0 |foreach {start-sleep -s 1; Write-Progress -Activity "Waiting $_ for Job $JobID - $jobName..." -Status "$(get-date) - Status: $jobStatus   - $jobPercent%" -PercentComplete $jobPercent}
+	}
+}
+
+# Function PERC RAID Initialization
+function WaitForInitialization {
+	$opState = "Initializing"
+	while ($opState -match 'Initializing') {
+		$virtDiskInfo = (x:\racadm\racadm.exe storage get vdisks --refkey $($DesiredProduct.PERCLocation) -o -p OperationalState,Progress)
+		if ($virtDiskInfo -match "Invalid Property Name\s*= Progress") {
+			$opState = "Done"
+			$progress = 100
+		} else {
+			$progress = ($virtDiskInfo |Select-String -Pattern "Progress\s*=").Line.Split("=")[1].Replace("%","").Trim()
+			$opState = ($virtDiskInfo |Select-String -Pattern "OperationalState\s*=").Line.Split("=")[1].Trim()
+		}
+		
+		5..0 |foreach {start-sleep -s 1; Write-Progress -Activity "Waiting for RAID to initialize..." -Status "$(get-date) - Status: $opState   - $progress%" -PercentComplete $progress}
+	}
+}
+
+Write-Host "[BIOS Settings]" -ForegroundColor Yellow
+#BIOS TPM Status
+if ($tpmStatus -eq ($DesiredProduct.TPMStatus) ){
+	Write-Host "TPM Status=$tpmStatus" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host "TPM Status=$tpmStatus(Expected: $($DesiredProduct.TPMStatus))" -ForegroundColor Red
+	$flagTPMWrong=$true
+    $testResults.Add($false)
+}
+#BIOS SecureBoot Status
+if ($secureBootStatus -eq ($DesiredProduct.SecureBootStatus) ){
+	Write-Host "SecureBoot Status=$secureBootStatus" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host "SecureBoot Status=$secureBootStatus(Expected: $($DesiredProduct.SecureBootStatus))" -ForegroundColor Red
+	$flagSecureBootWrong=$true
+    $testResults.Add($false)
+}
+#BIOS SecureBoot Policy
+if ($secureBootPolicy -eq ($DesiredProduct.SecureBootPolicy) ){
+	Write-Host "SecureBoot Policy=$secureBootStatus" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host "SecureBoot Policy=$secureBootStatus(Expected: $($DesiredProduct.SecureBootPolicy))" -ForegroundColor Red
+	$flagSecureBootPolicyWrong=$true
+    $testResults.Add($false)
+}
+#BIOS SecureBoot Mode
+if ($secureBootMode -eq ($DesiredProduct.SecureBootMode) ){
+	Write-Host "SecureBoot Mode=$secureBootMode" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host "SecureBoot Mode=$secureBootMode(Expected: $($DesiredProduct.SecureBootMode))" -ForegroundColor Red
+	$flagSecureBootModeWrong=$true
+    $testResults.Add($false)
+}
+#BIOS Boot Mode
+if ($biosBootMode -eq ($DesiredProduct.BootMode) ){
+	Write-Host "Boot Mode=$biosBootMode" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host "Boot Mode=$biosBootMode(Expected: $($DesiredProduct.BootMode))" -ForegroundColor Red
+	$flagBootModeWrong=$true
+    $testResults.Add($false)
+}
+#Network Boot Mode
+if ($networkBootMode -eq ($DesiredProduct.NetworkBoot) ){
+	Write-Host "Network Boot Mode=$networkBootMode" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host "Network Boot Mode=$networkBootMode(Expected: $($DesiredProduct.NetworkBoot))" -ForegroundColor Red
+	$flagNetworkBootModeWrong=$true
+    $testResults.Add($false)
+}
+
+Write-Host "[IDSDM RAID]" -ForegroundColor Yellow
+#IDSDM RAID Mode
+if ($IDSDMRAIDMode -eq ($DesiredProduct.IDSDMRAIDMode) ){
+	Write-Host "IDSDM RAID Mode=$IDSDMRAIDMode" -ForegroundColor Green
+	$testResults.Add($true)
+} else {
+	Write-Host "IDSDM RAID Mode=$IDSDMRAIDMode (Expected: $($DesiredProduct.IDSDMRAIDMode))" -ForegroundColor Red
+	$flagIDSDMRAIDModeWrong=$true
+	$testResults.Add($false)
+}
+#IDSDM RAID Enabled
+if ($IDSDMEnabled -eq ($DesiredProduct.IDSDMEnabled) ){
+	Write-Host "IDSDM RAID Enabled=$IDSDMEnabled" -ForegroundColor Green
+	$testResults.Add($true)
+} else {
+	Write-Host "IDSDM RAID Enabled=$IDSDMEnabled (Expected: $($DesiredProduct.IDSDMEnabled))" -ForegroundColor Red
+	$flagIDSDMRAIDModeWrong=$true
+	$testResults.Add($false)
+}
+#IDSDM RAID Size
+foreach ($disk in $WMIDisks) {
+	if ($disk.Model -eq "DELL IDSDM USB Device") {
+		$idsdmSize=$disk.Size
+	}
+}
+if ($idsdmSize -eq ($DesiredProduct.IDSDMSize) ){
+	Write-Host "IDSDM RAID Size=$($idsdmSize)" -ForegroundColor Green
+	$testResults.Add($true)
+} else {
+	Write-Host "IDSDM RAID Size=$($idsdmSize) (Expected: $($DesiredProduct.IDSDMSize))" -ForegroundColor Red
+	$flagIDSDMRAIDModeWrong=$true
+	$testResults.Add($false)
+}
+
+Write-Host "[PERC RAID]" -ForegroundColor Yellow
+#PERC Name
+if ($percName -eq $DesiredProduct.PERCName) {
+	Write-Host "PERC Name=$percName" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host  "PERCName=$percName(Expected: $($DesiredProduct.PERCName))" -ForegroundColor Red
+	$flagPERCRAIDWrong=$true
+    $testResults.Add($false)
+}
+#VD Name
+if ($vdName -eq $DesiredProduct.PERCVDName) {
+	Write-Host "VD Name=$vdName" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host  "VD Name=$vdName(Expected: $($DesiredProduct.PERCVDName))" -ForegroundColor Red
+	$flagPERCRAIDWrong=$true
+    $testResults.Add($false)
+}
+#RAID Type
+if ($vdType -eq $DesiredProduct.PERCRAIDType) {
+	Write-Host "RAID Type=$vdType" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host  "RAID Type=$vdType(Expected: $($DesiredProduct.PERCRAIDType))" -ForegroundColor Red
+	$flagPERCRAIDWrong=$true
+    $testResults.Add($false)
+}
+#VD Status
+if ($vdStatus -eq $DesiredProduct.PERCVDStatus) {
+	Write-Host "VD Status=$vdStatus" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host  "VD Status=$vdStatus(Expected: $($DesiredProduct.PERCVDStatus))" -ForegroundColor Red
+	$flagPERCRAIDWrong=$true
+    $testResults.Add($false)
+}
+#VD State
+if ($vdState -eq $DesiredProduct.PERCVDState) {
+	Write-Host "VD State=$vdState" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host  "VD State=$vdState(Expected: $($DesiredProduct.PERCVDState))" -ForegroundColor Red
+	$flagPERCRAIDWrong=$true
+    $testResults.Add($false)
+}
+#VD Operational State
+if ($vdOpState -eq $DesiredProduct.PERCVDOpState) {
+	Write-Host "VD Operational State=$vdOpState" -ForegroundColor Green
+    $testResults.Add($true)
+} else {
+	Write-Host  "VD Operational State=$vdOpState(Expected: $($DesiredProduct.PERCVDOpState))" -ForegroundColor Red
+	$flagPERCRAIDWrong=$true
+    $testResults.Add($false)
+}
+
+Write-Host ""
+Write-Host ""
+"[Test Results]"
+if ($false -in $testResults) {
+	$rebootReq=$false
+    Write-Host "All Tests Passed=False" -ForegroundColor White -BackgroundColor DarkRed
+	# Is TPM Wrong?
+	if ($flagTPMWrong -eq $true) {
+		Write-Host "TPM was not set correctly."
+		$result = x:\racadm\racadm.exe set BIOS.SysSecurity.TpmSecurity On
+		$flagBIOSJob=$true
+		$flagRebootReq=$true
+	}
+	
+	# Is SecureBootStatus Wrong?
+	if ($flagSecureBootWrong -eq $true) {
+		Write-Host "SecureBoot was not set correctly."
+		$result = x:\racadm\racadm.exe set BIOS.SysSecurity.SecureBoot Disabled
+		$flagBIOSJob=$true
+		$flagRebootReq=$true
+	}
+	
+	# Is SecureBootPolicy Wrong?
+	if ($flagSecureBootPolicyWrong -eq $true) {
+		Write-Host "SecureBootPolicy was not set correctly."
+		$result = x:\racadm\racadm.exe set BIOS.SysSecurity.SecureBootPolicy Custom
+		$flagBIOSJob=$true
+		$flagRebootReq=$true
+	}
+	
+	# Is SecureBootMode Wrong?
+	if ($flagSecureBootModeWrong -eq $true) {
+		Write-Host "SecureBootMode was not set correctly."
+		$result = x:\racadm\racadm.exe set BIOS.SysSecurity.SecureBootMode UserMode
+		$flagBIOSJob=$true
+		$flagRebootReq=$true
+	}
+	
+	# Is BootMode Wrong?
+	if ($flagBootModeWrong -eq $true) {
+		Write-Host "BootMode was not set correctly."
+		$result = x:\racadm\racadm.exe set BIOS.BiosBootSettings.BootMode Uefi
+		$flagBIOSJob=$true
+		$flagRebootReq=$true
+	}
+	
+	# Is NetworkBootMode Wrong?
+	if ($flagNetworkBootModeWrong -eq $true) {
+		Write-Host "NetworkBootMode was not set correctly."
+		$result = x:\racadm\racadm.exe set BIOS.NetworkSettings.PxeDev1EnDis Enabled
+		$flagBIOSJob=$true
+		$flagRebootReq=$true
+	}
+	
+	# Is IDSDM RAID Wrong?
+	if ($flagIDSDMRAIDModeWrong -eq $true) {
+		Write-Host "IDSDM RAID Mode was not set correctly."
+		$result = X:\racadm\racadm.exe set BIOS.IntegratedDevices.InternalSdCardRedundancy Mirror
+		$flagBIOSJob=$true
+		$flagRebootReq=$true
+	}
+	
+	# Lets see if it was just the storage array wasnt built	
+	# Is the RAID Type wrong?
+	if ($flagPERCRAIDWrong -eq $true) {
+		Write-Host "Will try to fix by building array."
+		InitPERCRAID
+		$flagRebootReq=$true
+	}
+	
+	if ($flagRebootReq -eq $true) {
+		if ($flagBIOSJob -eq $true) {
+			racadm jobqueue create BIOS.Setup.1-1
+		}
+		Write-Host "Need to reboot!"
+		wpeutil reboot
+	}
+
+	while($true) {
+		$wshell.Popup("!!! DO NOT CONTINUE !!!`n`n`nAll checks were not successfull. See script for what failed. `n`n`nPlease Contact Engineering.",0,"FAIL",16) > $null
+	}
+} else {
+    Write-Host "All Tests Passed=True" -ForegroundColor White -BackgroundColor DarkGreen
+}
+$DeployID=((Select-String -path R:\*_Flow.xml -Pattern "Use preset:") -split":")[1].Trim()
+& X:\Arrow.SoftThinks.Workbench\aswCLI.exe SendLog --DeployID $DeployID --file log.txt
+Stop-Transcript
